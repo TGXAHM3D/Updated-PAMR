@@ -1,0 +1,100 @@
+[
+  {
+    "a_code": "OPLA",
+    "cc": "LHE",
+    "airport_name": "Allama Iqbal International Airport",
+    "city_name": "Lahore",
+    "airport_type": "International"
+  },
+  {
+    "a_code": "OPKC",
+    "cc": "KHI",
+    "airport_name": "Jinnah International Airport",
+    "city_name": "Karachi",
+    "airport_type": "International"
+  },
+  {
+    "a_code": "OPIS",
+    "cc": "ISB",
+    "airport_name": "Islamabad International Airport",
+    "city_name": "Islamabad",
+    "airport_type": "International"
+  },
+  {
+    "a_code": "OPPS",
+    "cc": "PEW",
+    "airport_name": "Peshawar Bacha Khan International Airport",
+    "city_name": "Peshawar",
+    "airport_type": "International"
+  },
+  {
+    "a_code": "OPQT",
+    "cc": "UET",
+    "airport_name": "Quetta International Airport",
+    "city_name": "Quetta",
+    "airport_type": "International"
+  },
+  {
+    "a_code": "OPMT",
+    "cc": "MUX",
+    "airport_name": "Multan International Airport",
+    "city_name": "Multan",
+    "airport_type": "International"
+  },
+  {
+    "a_code": "OPFA",
+    "cc": "LYP",
+    "airport_name": "Faislabad International Airport",
+    "city_name": "Faisalabad",
+    "airport_type": "International"
+  },
+  {
+    "a_code": "OPST",
+    "cc": "SKT",
+    "airport_name": "Sialkot International Airport",
+    "city_name": "Sialkot",
+    "airport_type": "International"
+  },
+  {
+    "a_code": "OPGD",
+    "cc": "GWD",
+    "airport_name": "Gwadar International Airport",
+    "city_name": "Gwadar",
+    "airport_type": "International"
+  },
+  {
+    "a_code": "OPGT",
+    "cc": "GIL",
+    "airport_name": "Gilgit Airport",
+    "city_name": "Gilgit",
+    "airport_type": "Domestic"
+  },
+  {
+    "a_code": "OPBW",
+    "cc": "BHV",
+    "airport_name": "Bahawalpur Airport",
+    "city_name": "Bhawalpur",
+    "airport_type": "Domestic"
+  },
+  {
+    "a_code": "OPRK",
+    "cc": "RYK",
+    "airport_name": "Rahim Yar Khan Sheikh Zayed International Airport",
+    "city_name": "Rahim Yar Khan",
+    "airport_type": "International"
+  },
+  {
+    "a_code": "OPSK",
+    "cc": "SKZ",
+    "airport_name": "Sukkur Airport",
+    "city_name": "Sukkur",
+    "airport_type": "Domestic"
+  },
+  {
+    "a_code": "OPSD",
+    "cc": "KDU",
+    "airport_name": "Skardu Airport",
+    "city_name": "Skardu",
+    "airport_type": "Domestic"
+  }
+]
