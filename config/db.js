@@ -9,6 +9,10 @@ const mongoose = require('mongoose');
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/PAMR';
 
 let pending = null;
+let lastError = null;
+
+// Never expose credentials in error text.
+const redact = s => String(s).replace(/\/\/[^@/\s]*@/g, '//***@');
 
 function isConnected() {
   return mongoose.connection.readyState === 1;
@@ -21,10 +25,12 @@ async function connectDB() {
       .connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
       .then(() => {
         console.log('MongoDB connected -', mongoose.connection.name, '@', mongoose.connection.host);
+        lastError = null;
         return true;
       })
       .catch(err => {
-        console.error('MongoDB connection failed:', err.message);
+        lastError = redact(err.message);
+        console.error('MongoDB connection failed:', lastError);
         pending = null; // allow a retry on the next request
         return false;
       });
@@ -32,4 +38,6 @@ async function connectDB() {
   return pending;
 }
 
-module.exports = { connectDB, isConnected, MONGO_URI, mongoose };
+const getLastError = () => lastError;
+
+module.exports = { connectDB, isConnected, getLastError, MONGO_URI, mongoose };

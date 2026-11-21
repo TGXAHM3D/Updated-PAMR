@@ -4,7 +4,7 @@
 const express = require('express');
 const path = require('path');
 
-const { connectDB, isConnected, MONGO_URI } = require('./config/db');
+const { connectDB, isConnected, getLastError, MONGO_URI } = require('./config/db');
 const Airport = require('./models/Airport');
 const Departure = require('./models/Departure');
 const Arrival = require('./models/Arrival');
@@ -68,6 +68,8 @@ app.get('/api/health', async (req, res) => {
   res.json({
     status: 'ok',
     db: isConnected() ? 'connected' : 'disconnected',
+    db_uri_set: Boolean(process.env.MONGO_URI),
+    ...(isConnected() ? {} : { db_error: getLastError() }),
     server: 'PAMR API v1.0 (MongoDB)',
     time: new Date().toISOString(),
   });
