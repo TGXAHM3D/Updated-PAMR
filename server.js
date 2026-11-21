@@ -24,8 +24,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve frontend static files
-app.use(express.static(path.join(__dirname)));
+// Serve frontend static files (locally; on Vercel, public/ is served by the CDN)
+const PUBLIC_DIR = path.join(__dirname, 'public');
+app.use(express.static(PUBLIC_DIR));
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -62,7 +63,8 @@ const withLive = (rows, calc) => rows.map(r => ({ ...r, live_status: calc(r.stat
 // ─── Routes ─────────────────────────────────────────────────────────────────
 
 // GET /api/health
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
+  await connectDB();
   res.json({
     status: 'ok',
     db: isConnected() ? 'connected' : 'disconnected',
@@ -71,9 +73,10 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Everything below needs the database - fail fast instead of hanging.
-app.use('/api', (req, res, next) => {
-  if (!isConnected()) {
+// Everything below needs the database. Connect on demand (serverless cold
+// start), then fail fast with 503 instead of hanging if it is unreachable.
+app.use('/api', async (req, res, next) => {
+  if (!(await connectDB())) {
     return res.status(503).json({ success: false, error: 'Database not connected' });
   }
   next();
@@ -305,11 +308,14 @@ app.use('/api', (req, res) => res.status(404).json({ success: false, error: 'Not
 
 // Fallback - serve frontend index.html
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
-// Start server
-connectDB().then(() => {
+// Vercel imports the app and runs it as a function.
+module.exports = app;
+
+// Start a normal server only when run directly (npm start / npm run dev).
+if (require.main === module) connectDB().then(() => {
   app.listen(PORT, () => {
     console.log('');
     console.log('╔══════════════════════════════════════╗');

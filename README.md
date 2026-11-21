@@ -7,13 +7,13 @@
 
 ```
 PAMR/
-├── Server.js            ← Express API server (MongoDB via Mongoose)
+├── server.js            ← Express API (exports the app for Vercel; listens when run directly)
 ├── config/db.js         ← MongoDB connection (MONGO_URI)
 ├── models/              ← Airport, Departure, Arrival schemas
 ├── utils/status.js      ← live status (replaces the old MySQL EVENT)
 ├── seed/seed.js         ← loads seed/data/*.json into MongoDB
 ├── seed/data/           ← airports / departures / arrivals (from PROJECT PAMR.sql)
-├── index.html, style.css, script.js   ← frontend
+├── public/              ← frontend: index.html, style.css, script.js
 └── PROJECT PAMR.sql     ← original MySQL schema (kept for reference only)
 ```
 
@@ -65,6 +65,27 @@ MongoDB connected - PAMR @ 127.0.0.1
 ### STEP 5 — Open the frontend
 
 Go to http://localhost:3000 — the backend serves the frontend.
+
+---
+
+## DEPLOYING TO VERCEL
+
+Vercel runs `server.js` as a serverless function and serves `public/` from its CDN.
+It **cannot** reach a MongoDB running on your PC, so use a cloud database:
+
+1. Create a free cluster on [MongoDB Atlas](https://www.mongodb.com/atlas).
+2. In Atlas → **Database Access**, add a database user.
+3. In Atlas → **Network Access**, allow `0.0.0.0/0` (Vercel has no fixed IPs).
+4. Copy the connection string and add the database name, e.g.
+   `mongodb+srv://USER:PASS@cluster0.xxxxx.mongodb.net/PAMR`
+5. Load the data into Atlas from your PC:
+   ```powershell
+   $env:MONGO_URI = "mongodb+srv://USER:PASS@cluster0.xxxxx.mongodb.net/PAMR"; npm run seed
+   ```
+6. In Vercel → Project → **Settings → Environment Variables**, add `MONGO_URI` with the
+   same value (Production + Preview), then **redeploy**.
+
+Check it with `https://<your-app>.vercel.app/api/health` — it should say `"db": "connected"`.
 
 ---
 
