@@ -1,0 +1,20 @@
+# Dependencies (reinstall with `npm install`)
+node_modules/
+
+# Environment / secrets (MONGO_URI etc.)
+.env
+.env.*
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local MongoDB data, if ever run from inside the project
+data/db/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+~$*.docx

@@ -1,9 +1,14 @@
 // PAMR - Pakistan Airport Management Record
-// Backend API Server | Node.js + Express + MySQL2
+// Backend API Server | Node.js + Express + MongoDB (Mongoose)
 
 const express = require('express');
-const mysql = require('mysql2/promise');
 const path = require('path');
+
+const { connectDB, isConnected, MONGO_URI } = require('./config/db');
+const Airport = require('./models/Airport');
+const Departure = require('./models/Departure');
+const Arrival = require('./models/Arrival');
+const { calcDepStatus, calcArrStatus } = require('./utils/status');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,176 +27,126 @@ app.use((req, res, next) => {
 // Serve frontend static files
 app.use(express.static(path.join(__dirname)));
 
-// Edit these to match your MySQL credentials. You can also set them via environment
-// variables (for example in a .env file) for better security.
-const DB_CONFIG = {
-  host: process.env.DB_HOST || '127.0.0.1',
-  port: process.env.DB_PORT || 3306,
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASS || '0925',
-  database: process.env.DB_NAME || 'PAMR',
-  waitForConnections: true,
-  connectionLimit: 10,
-  timezone: '+05:00', // PKT
-};
+// ─── Helpers ────────────────────────────────────────────────────────────────
 
-let pool;
+// Fields returned to the client (same shape the MySQL rows had).
+const HIDE = { _id: 0, createdAt: 0, updatedAt: 0 };
 
-async function connectDB() {
-  try {
-    pool = mysql.createPool(DB_CONFIG);
-    const conn = await pool.getConnection();
-    console.log('MySQL connected -', DB_CONFIG.database, '@', DB_CONFIG.host);
-    conn.release();
-  } catch (err) {
-    console.error('MySQL connection failed:', err.message);
-    console.warn('Running in DEMO mode - live DB queries will return mock data');
-    pool = null;
+const escapeRegex = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const like = s => new RegExp(escapeRegex(s), 'i'); // SQL `LIKE '%s%'`
+const upper = s => String(s).trim().toUpperCase();
+
+/** Keep only keys that were actually sent (so PUT doesn't blank out fields). */
+function pick(body, keys) {
+  const out = {};
+  for (const k of keys) if (body[k] !== undefined && body[k] !== '') out[k] = body[k];
+  return out;
+}
+
+/** Map Mongo/Mongoose errors to HTTP responses. */
+function sendError(res, err) {
+  if (err && err.code === 11000) {
+    return res.status(409).json({ success: false, error: 'Callsign already exists' });
   }
+  if (err && (err.name === 'ValidationError' || err.name === 'CastError')) {
+    const msg = err.errors
+      ? Object.values(err.errors).map(e => e.message).join('; ')
+      : err.message;
+    return res.status(400).json({ success: false, error: msg });
+  }
+  return res.status(500).json({ success: false, error: err.message });
 }
 
-// Live status helper (mirrors SQL CASE logic)
-function calcDepStatus(stat, timesStr) {
-  const fixed = ['Cancelled', 'Delayed', 'Estimated'];
-  if (fixed.includes(stat)) return stat;
+const withLive = (rows, calc) => rows.map(r => ({ ...r, live_status: calc(r.stat, r.times) }));
 
-  const now = new Date();
-  const [h, m, s] = String(timesStr || '00:00:00').split(':').map(Number);
-  const ft = new Date(now);
-  ft.setHours(h, m, s, 0);
-
-  const diff = (ft - now) / 60000;
-  if (diff <= 0) return 'Departed';
-  if (diff <= 30) return 'Boarding';
-  return 'Scheduled';
-}
-
-function calcArrStatus(stat, timesStr) {
-  const fixed = ['Cancelled', 'Delayed', 'Estimated'];
-  if (fixed.includes(stat)) return stat;
-
-  const now = new Date();
-  const [h, m, s] = String(timesStr || '00:00:00').split(':').map(Number);
-  const ft = new Date(now);
-  ft.setHours(h, m, s, 0);
-
-  const diff = (ft - now) / 60000;
-  if (diff <= 0) return 'Landed';
-  if (diff <= 30) return 'Arriving';
-  return 'Scheduled';
-}
-
-// Query wrapper
-async function query(sql, params = []) {
-  if (!pool) throw new Error('No database connection');
-  const [rows] = await pool.execute(sql, params);
-  return rows;
-}
+// ─── Routes ─────────────────────────────────────────────────────────────────
 
 // GET /api/health
-app.get('/api/health', async (req, res) => {
-  const dbOk = pool !== null;
+app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    db: dbOk ? 'connected' : 'disconnected',
-    server: 'PAMR API v1.0',
+    db: isConnected() ? 'connected' : 'disconnected',
+    server: 'PAMR API v1.0 (MongoDB)',
     time: new Date().toISOString(),
   });
+});
+
+// Everything below needs the database - fail fast instead of hanging.
+app.use('/api', (req, res, next) => {
+  if (!isConnected()) {
+    return res.status(503).json({ success: false, error: 'Database not connected' });
+  }
+  next();
 });
 
 // GET /api/airports
 app.get('/api/airports', async (req, res) => {
   try {
-    const rows = await query('SELECT * FROM airports ORDER BY airport_name ASC');
+    const rows = await Airport.find({}, HIDE).sort({ airport_name: 1 }).lean();
     res.json({ success: true, data: rows });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    sendError(res, err);
   }
 });
 
-// GET /api/departures?airport=LHE&status=Delayed
+/**
+ * Build a filter for departures/arrivals.
+ *   boardField - field holding the board's own airport (dep: dc, arr: cc)
+ *   nameField  - other-end city name (dep: d_name, arr: a_name)
+ */
+function flightFilter(q, boardField, nameField) {
+  const filter = {};
+  if (q.airport) filter[boardField] = upper(q.airport);
+  if (q.airline) filter.airl = like(q.airline);
+  if (q.search) {
+    const rx = like(q.search);
+    filter.$or = [{ cs: rx }, { [nameField]: rx }, { airl: rx }];
+  }
+  return filter;
+}
+
+/** ?status= filters on the *live* status, which is what the board displays
+ *  (the old MySQL EVENT rewrote `stat` every minute, so the two matched). */
+const byStatus = (rows, status) => (status ? rows.filter(r => r.live_status === status) : rows);
+
+// GET /api/departures?airport=LHE&status=Delayed&airline=..&search=..
 app.get('/api/departures', async (req, res) => {
   try {
-    const { airport, status, airline, search } = req.query;
-    let sql = 'SELECT * FROM departures WHERE 1=1';
-    const params = [];
-
-    if (airport) {
-      sql += ' AND dc = ?';
-      params.push(airport);
-    }
-    if (status) {
-      sql += ' AND stat = ?';
-      params.push(status);
-    }
-    if (airline) {
-      sql += ' AND airl LIKE ?';
-      params.push(`%${airline}%`);
-    }
-    if (search) {
-      sql += ' AND (cs LIKE ? OR d_name LIKE ? OR airl LIKE ?)';
-      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
-    }
-
-    sql += ' ORDER BY times ASC';
-
-    const rows = await query(sql, params);
-    const data = rows.map(r => ({ ...r, live_status: calcDepStatus(r.stat, r.times) }));
+    const rows = await Departure.find(flightFilter(req.query, 'dc', 'd_name'), HIDE)
+      .sort({ times: 1 }).lean();
+    const data = byStatus(withLive(rows, calcDepStatus), req.query.status);
     res.json({ success: true, count: data.length, data });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    sendError(res, err);
   }
 });
 
 // GET /api/arrivals?airport=LHE
+// An arrival's `cc` is the airport it lands AT; `ac` is where it comes from.
 app.get('/api/arrivals', async (req, res) => {
   try {
-    const { airport, status, airline, search } = req.query;
-    let sql = 'SELECT * FROM arrival WHERE 1=1';
-    const params = [];
-
-    if (airport) {
-      sql += ' AND ac = ?';
-      params.push(airport);
-    }
-    if (status) {
-      sql += ' AND stat = ?';
-      params.push(status);
-    }
-    if (airline) {
-      sql += ' AND airl LIKE ?';
-      params.push(`%${airline}%`);
-    }
-    if (search) {
-      sql += ' AND (cs LIKE ? OR a_name LIKE ? OR airl LIKE ?)';
-      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
-    }
-
-    sql += ' ORDER BY times ASC';
-
-    const rows = await query(sql, params);
-    const data = rows.map(r => ({ ...r, live_status: calcArrStatus(r.stat, r.times) }));
+    const rows = await Arrival.find(flightFilter(req.query, 'cc', 'a_name'), HIDE)
+      .sort({ times: 1 }).lean();
+    const data = byStatus(withLive(rows, calcArrStatus), req.query.status);
     res.json({ success: true, count: data.length, data });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    sendError(res, err);
   }
 });
 
 // GET /api/flights/:cs
 app.get('/api/flights/:cs', async (req, res) => {
   try {
-    const { cs } = req.params;
-    const deps = await query('SELECT *, "DEP" AS type FROM departures WHERE cs = ?', [cs]);
-    const arrs = await query('SELECT *, "ARR" AS type FROM arrival WHERE cs = ?', [cs]);
-    const all = [...deps, ...arrs];
+    const cs = upper(req.params.cs);
+    const dep = await Departure.findOne({ cs }, HIDE).lean();
+    if (dep) return res.json({ success: true, data: { ...dep, type: 'DEP', live_status: calcDepStatus(dep.stat, dep.times) } });
 
-    if (!all.length) {
-      return res.status(404).json({ success: false, error: 'Flight not found' });
-    }
+    const arr = await Arrival.findOne({ cs }, HIDE).lean();
+    if (arr) return res.json({ success: true, data: { ...arr, type: 'ARR', live_status: calcArrStatus(arr.stat, arr.times) } });
 
-    res.json({ success: true, data: all[0] });
+    res.status(404).json({ success: false, error: 'Flight not found' });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    sendError(res, err);
   }
 });
 
@@ -199,52 +154,40 @@ app.get('/api/flights/:cs', async (req, res) => {
 app.get('/api/stats', async (req, res) => {
   try {
     const { airport } = req.query;
-    const apFilter = airport ? ' WHERE dc = ?' : '';
-    const apFilter2 = airport ? ' WHERE ac = ?' : '';
-    const p = airport ? [airport] : [];
+    const proj = { stat: 1, times: 1, _id: 0 };
+    const [deps, arrs] = await Promise.all([
+      Departure.find(airport ? { dc: upper(airport) } : {}, proj).lean(),
+      Arrival.find(airport ? { cc: upper(airport) } : {}, proj).lean(),
+    ]);
 
-    const [totalDep] = await query(`SELECT COUNT(*) AS n FROM departures${apFilter}`, p);
-    const [totalArr] = await query(`SELECT COUNT(*) AS n FROM arrival${apFilter2}`, p);
-    const [delayed] = await query(
-      `SELECT COUNT(*) AS n FROM (SELECT cs FROM departures WHERE stat='Delayed'${airport ? ' AND dc=?' : ''} UNION ALL SELECT cs FROM arrival WHERE stat='Delayed'${airport ? ' AND ac=?' : ''}) t`,
-      airport ? [airport, airport] : []
-    );
-    const [cancelled] = await query(
-      `SELECT COUNT(*) AS n FROM (SELECT cs FROM departures WHERE stat='Cancelled'${airport ? ' AND dc=?' : ''} UNION ALL SELECT cs FROM arrival WHERE stat='Cancelled'${airport ? ' AND ac=?' : ''}) t`,
-      airport ? [airport, airport] : []
-    );
-    const [ontime] = await query(
-      `SELECT COUNT(*) AS n FROM (SELECT cs FROM departures WHERE stat='Departed'${airport ? ' AND dc=?' : ''} UNION ALL SELECT cs FROM arrival WHERE stat='Landed'${airport ? ' AND ac=?' : ''}) t`,
-      airport ? [airport, airport] : []
-    );
+    const depLive = deps.map(d => calcDepStatus(d.stat, d.times));
+    const arrLive = arrs.map(a => calcArrStatus(a.stat, a.times));
+    const all = [...depLive, ...arrLive];
+    const count = s => all.filter(x => x === s).length;
 
     res.json({
       success: true,
       data: {
-        departures: totalDep.n,
-        arrivals: totalArr.n,
-        delayed: delayed.n,
-        cancelled: cancelled.n,
-        ontime: ontime.n,
+        departures: deps.length,
+        arrivals: arrs.length,
+        delayed: count('Delayed'),
+        cancelled: count('Cancelled'),
+        ontime: depLive.filter(s => s === 'Departed').length + arrLive.filter(s => s === 'Landed').length,
       },
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    sendError(res, err);
   }
 });
 
 // GET /api/airlines
 app.get('/api/airlines', async (req, res) => {
   try {
-    const rows = await query(
-      `SELECT DISTINCT airl FROM departures
-       UNION
-       SELECT DISTINCT airl FROM arrival
-       ORDER BY airl ASC`
-    );
-    res.json({ success: true, data: rows.map(r => r.airl) });
+    const [a, b] = await Promise.all([Departure.distinct('airl'), Arrival.distinct('airl')]);
+    const data = [...new Set([...a, ...b])].sort((x, y) => x.localeCompare(y));
+    res.json({ success: true, data });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    sendError(res, err);
   }
 });
 
@@ -255,17 +198,14 @@ app.post('/api/departures', async (req, res) => {
     if (!cs || !airl || !cc || !dc || !d_name || !times) {
       return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
-
-    await query(
-      'INSERT INTO departures (cs, airl, cc, dc, d_name, times, stat) VALUES (?,?,?,?,?,?,?)',
-      [cs, airl, cc, dc, d_name, times, stat || 'Scheduled']
-    );
-    res.status(201).json({ success: true, message: `Flight ${cs} added to departures` });
-  } catch (err) {
-    if (err.code === 'ER_DUP_ENTRY') {
+    // A callsign must be unique across both boards (it was the PK of each table).
+    if (await Arrival.exists({ cs: upper(cs) })) {
       return res.status(409).json({ success: false, error: 'Callsign already exists' });
     }
-    res.status(500).json({ success: false, error: err.message });
+    await Departure.create({ cs, airl, cc, dc, d_name, times, stat: stat || 'Scheduled' });
+    res.status(201).json({ success: true, message: `Flight ${upper(cs)} added to departures` });
+  } catch (err) {
+    sendError(res, err);
   }
 });
 
@@ -276,103 +216,92 @@ app.post('/api/arrivals', async (req, res) => {
     if (!cs || !airl || !ac || !cc || !a_name || !times) {
       return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
-
-    await query(
-      'INSERT INTO arrival (cs, airl, ac, cc, a_name, times, stat) VALUES (?,?,?,?,?,?,?)',
-      [cs, airl, ac, cc, a_name, times, stat || 'Scheduled']
-    );
-    res.status(201).json({ success: true, message: `Flight ${cs} added to arrivals` });
-  } catch (err) {
-    if (err.code === 'ER_DUP_ENTRY') {
+    if (await Departure.exists({ cs: upper(cs) })) {
       return res.status(409).json({ success: false, error: 'Callsign already exists' });
     }
-    res.status(500).json({ success: false, error: err.message });
+    await Arrival.create({ cs, airl, ac, cc, a_name, times, stat: stat || 'Scheduled' });
+    res.status(201).json({ success: true, message: `Flight ${upper(cs)} added to arrivals` });
+  } catch (err) {
+    sendError(res, err);
   }
 });
+
+const UPDATE_OPTS = { new: true, runValidators: true, projection: HIDE };
 
 // PUT /api/departures/:cs
 app.put('/api/departures/:cs', async (req, res) => {
   try {
-    const { cs } = req.params;
-    const { airl, cc, d_name, times, stat } = req.body;
-    await query(
-      'UPDATE departures SET airl=?, cc=?, d_name=?, times=?, stat=? WHERE cs=?',
-      [airl, cc, d_name, times, stat, cs]
-    );
-    res.json({ success: true, message: `Departure ${cs} updated` });
+    const cs = upper(req.params.cs);
+    const doc = await Departure.findOneAndUpdate(
+      { cs }, { $set: pick(req.body, ['airl', 'cc', 'dc', 'd_name', 'times', 'stat']) }, UPDATE_OPTS
+    ).lean();
+    if (!doc) return res.status(404).json({ success: false, error: 'Flight not found' });
+    res.json({ success: true, message: `Departure ${cs} updated`, data: doc });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    sendError(res, err);
   }
 });
 
 // PUT /api/arrivals/:cs
 app.put('/api/arrivals/:cs', async (req, res) => {
   try {
-    const { cs } = req.params;
-    const { airl, ac, a_name, times, stat } = req.body;
-    await query(
-      'UPDATE arrival SET airl=?, ac=?, a_name=?, times=?, stat=? WHERE cs=?',
-      [airl, ac, a_name, times, stat, cs]
-    );
-    res.json({ success: true, message: `Arrival ${cs} updated` });
+    const cs = upper(req.params.cs);
+    const doc = await Arrival.findOneAndUpdate(
+      { cs }, { $set: pick(req.body, ['airl', 'ac', 'cc', 'a_name', 'times', 'stat']) }, UPDATE_OPTS
+    ).lean();
+    if (!doc) return res.status(404).json({ success: false, error: 'Flight not found' });
+    res.json({ success: true, message: `Arrival ${cs} updated`, data: doc });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    sendError(res, err);
   }
 });
 
 // DELETE /api/departures/:cs
 app.delete('/api/departures/:cs', async (req, res) => {
   try {
-    const { cs } = req.params;
-    await query('DELETE FROM departures WHERE cs = ?', [cs]);
+    const cs = upper(req.params.cs);
+    const r = await Departure.deleteOne({ cs });
+    if (!r.deletedCount) return res.status(404).json({ success: false, error: 'Flight not found' });
     res.json({ success: true, message: `Departure ${cs} deleted` });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    sendError(res, err);
   }
 });
 
 // DELETE /api/arrivals/:cs
 app.delete('/api/arrivals/:cs', async (req, res) => {
   try {
-    const { cs } = req.params;
-    await query('DELETE FROM arrival WHERE cs = ?', [cs]);
+    const cs = upper(req.params.cs);
+    const r = await Arrival.deleteOne({ cs });
+    if (!r.deletedCount) return res.status(404).json({ success: false, error: 'Flight not found' });
     res.json({ success: true, message: `Arrival ${cs} deleted` });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    sendError(res, err);
   }
 });
 
-// PUT /api/departures/:cs/status
-app.put('/api/departures/:cs/status', async (req, res) => {
-  try {
-    const { cs } = req.params;
-    const { stat } = req.body;
-    const allowed = ['Scheduled', 'Departed', 'Boarding', 'Delayed', 'Cancelled', 'Estimated'];
-    if (!allowed.includes(stat)) {
-      return res.status(400).json({ success: false, error: 'Invalid status value' });
+// PUT /api/departures/:cs/status  and  /api/arrivals/:cs/status
+function statusRoute(Model) {
+  return async (req, res) => {
+    try {
+      const cs = upper(req.params.cs);
+      const { stat } = req.body;
+      if (!Model.STATUSES.includes(stat)) {
+        return res.status(400).json({ success: false, error: 'Invalid status value' });
+      }
+      const r = await Model.updateOne({ cs }, { $set: { stat } });
+      if (!r.matchedCount) return res.status(404).json({ success: false, error: 'Flight not found' });
+      res.json({ success: true, message: `Status of ${cs} updated to ${stat}` });
+    } catch (err) {
+      sendError(res, err);
     }
-    await query('UPDATE departures SET stat=? WHERE cs=?', [stat, cs]);
-    res.json({ success: true, message: `Status of ${cs} updated to ${stat}` });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
+  };
+}
+app.put('/api/departures/:cs/status', statusRoute(Departure));
+app.put('/api/arrivals/:cs/status', statusRoute(Arrival));
 
-// PUT /api/arrivals/:cs/status
-app.put('/api/arrivals/:cs/status', async (req, res) => {
-  try {
-    const { cs } = req.params;
-    const { stat } = req.body;
-    const allowed = ['Scheduled', 'Landed', 'Arriving', 'Delayed', 'Cancelled', 'Estimated'];
-    if (!allowed.includes(stat)) {
-      return res.status(400).json({ success: false, error: 'Invalid status value' });
-    }
-    await query('UPDATE arrival SET stat=? WHERE cs=?', [stat, cs]);
-    res.json({ success: true, message: `Status of ${cs} updated to ${stat}` });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
+// Unknown API route
+app.use('/api', (req, res) => res.status(404).json({ success: false, error: 'Not found' }));
 
 // Fallback - serve frontend index.html
 app.get('*', (req, res) => {
@@ -385,20 +314,24 @@ connectDB().then(() => {
     console.log('');
     console.log('╔══════════════════════════════════════╗');
     console.log('║   PAMR API Server - Running          ║');
-    console.log(`║   http://localhost:${PORT}           ║`);
+    console.log(`║   http://localhost:${PORT}              ║`);
     console.log('║   Pakistan  Airspace  Record         ║');
     console.log('╚══════════════════════════════════════╝');
     console.log('');
+    console.log('Database:', MONGO_URI.replace(/\/\/[^@]*@/, '//***@'));
     console.log('Endpoints:');
     console.log('  GET  /api/airports');
     console.log('  GET  /api/departures?airport=LHE');
     console.log('  GET  /api/arrivals?airport=LHE');
     console.log('  GET  /api/stats?airport=LHE');
     console.log('  GET  /api/flights/:cs');
+    console.log('  GET  /api/airlines');
     console.log('  POST /api/departures');
     console.log('  POST /api/arrivals');
     console.log('  PUT  /api/departures/:cs');
     console.log('  PUT  /api/arrivals/:cs');
+    console.log('  PUT  /api/departures/:cs/status');
+    console.log('  PUT  /api/arrivals/:cs/status');
     console.log('  DEL  /api/departures/:cs');
     console.log('  DEL  /api/arrivals/:cs');
     console.log('');

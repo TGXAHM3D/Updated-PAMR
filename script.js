@@ -1,7 +1,8 @@
 // ═══════════════════════════════════════════════
 //  CONFIG — change this to your server address
 // ═══════════════════════════════════════════════
-const API = 'http://localhost:3000/api';
+// Same origin when served by the backend; localhost:3000 when opened as a file.
+const API = (location.protocol.startsWith('http') ? '' : 'http://localhost:3000') + '/api';
  
 // ═══════════════════════════════════════════════
 //  STATE
@@ -292,7 +293,8 @@ async function addFlight() {
     } else {
       await apiFetch('/arrivals', {
         method: 'POST',
-        body: JSON.stringify({ cs, airl, ac: selectedAirport.cc, cc, a_name: name, times, stat }),
+        // arrival: cc = this airport (where it lands), ac = origin code
+        body: JSON.stringify({ cs, airl, ac: cc, cc: selectedAirport.cc, a_name: name, times, stat }),
       });
     }
     toast(`Flight ${cs} added successfully`);
